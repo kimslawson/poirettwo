@@ -144,6 +144,85 @@ def snap_y(orig_y: float, new_y: float, radius: float) -> float:
     return new_y
 
 
+def _compute_y_scales(
+    positions: list[tuple[float, float]],
+    snap_radius: float,
+) -> list[float]:
+    """
+    Return a per-node y-scale factor (1.0 or 2.0).
+
+    Strokes whose outer edge sits exactly on an alignment metric (e.g. the
+    top bar of '7' touching y=750, or the base of '2' touching y=0) can only
+    expand on one side — the metric side is snapped and stays put.  To reach
+    the correct stroke thickness the free (inner) edge must travel 2× the
+    nominal delta.
+
+    Detection rule
+    ─────────────
+    For each node N not itself on a metric:
+      • Examine both adjacent nodes P in the path.
+      • If P is within snap_radius of a metric AND edge N→P is predominantly
+        vertical (|Δx| / |Δy| < 0.5), mark y_scale[N] = 2.0.
+
+    Propagation
+    ───────────
+    After the initial pass, nodes that share the same original y (within 3
+    units) as a marked node inherit y_scale=2.0.  This keeps horizontal
+    stroke faces flat (both endpoints of a crossbar bottom move equally).
+    """
+    n = len(positions)
+    y_scale = [1.0] * n
+
+    # ── Pass 1: direct detection ───────────────────────────────────────
+    # MAX_STROKE_Y caps the vertical-edge length we consider "a stroke".
+    # Horizontal strokes in Poiret Two are ~29–73 units tall.
+    # Long vertical edges (stems, descenders) are 200+ units — we must
+    # NOT flag those, or crossbar corners at y=0 would get doubled delta.
+    MAX_STROKE_Y = 100
+
+    for i in range(n):
+        ox, oy = positions[i]
+        # Skip if this node itself is on a metric — it will be snapped
+        if any(abs(oy - m) <= snap_radius for m in METRICS):
+            continue
+        for di in (-1, +1):
+            j   = (i + di) % n
+            pox, poy = positions[j]
+            # Neighbor must be metric-snapped (within snap_radius of a metric)
+            if not any(abs(poy - m) <= snap_radius for m in METRICS):
+                continue
+            dx = abs(pox - ox)
+            dy = abs(poy - oy)
+            if dy < 5 or dy > MAX_STROKE_Y:
+                continue          # degenerate or too long (a stem, not a stroke)
+            if dx > dy * 0.5:
+                continue          # too diagonal — not a clean vertical edge
+            y_scale[i] = 2.0
+            break
+
+    # ── Pass 2: propagate along same-y groups ─────────────────────────
+    # Any node within 3 units of a marked node's y inherits y_scale=2.0,
+    # so the inner face of a horizontal stroke moves uniformly.
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            if y_scale[i] != 2.0:
+                continue
+            oy_i = positions[i][1]
+            for j in range(n):
+                if y_scale[j] == 2.0:
+                    continue
+                oy_j = positions[j][1]
+                if abs(oy_j - oy_i) < 3:
+                    # Same-y group — if j is also on the "inside" (not at a metric)
+                    if not any(abs(oy_j - m) <= snap_radius for m in METRICS):
+                        y_scale[j] = 2.0
+                        changed = True
+
+    return y_scale
+
+
 # ── Path expansion ─────────────────────────────────────────────────────
 
 def expand_path(
@@ -153,13 +232,21 @@ def expand_path(
     snap_radius: float = SNAP,
 ) -> GSPath:
     """
-    Anisotropic miter-offset expansion.
+    Anisotropic miter-offset expansion with metric-boundary compensation.
 
     delta_x  expansion applied to the x-component of each node's miter
              displacement.  Controls horizontal movement = vertical-stem
              thickness.
     delta_y  expansion applied to the y-component.  Controls vertical
              movement = horizontal-stroke thickness.
+
+    Metric-boundary compensation
+    ─────────────────────────────
+    When a horizontal stroke has one face on a y-metric (baseline, cap
+    height …), that face is snapped and cannot move.  The opposite (inner)
+    face must travel 2×delta_y to reach the target stroke thickness.
+    _compute_y_scales() detects these nodes and returns y_scale=2.0 for
+    them; the doubled delta is applied here.
 
     For the monolinear Regular correction: delta_x=0, delta_y=2
     For the Bold expansion: delta_x=delta_y=DELTA (isotropic)
@@ -173,14 +260,16 @@ def expand_path(
     new_positions   = []
     new_nodes       = []
 
+    # Per-node y-scale factors (1.0 normal, 2.0 for metric-bounded inner faces)
+    y_scales = _compute_y_scales(positions, snap_radius)
+
     for i, (ox, oy) in enumerate(positions):
         if delta_x == 0.0 and delta_y == 0.0:
             nx, ny = ox, oy
         else:
-            # Unit miter bisector
             ux, uy = miter_displacement(positions, i, 1.0)
             ddx    = ux * delta_x
-            ddy    = uy * delta_y
+            ddy    = uy * delta_y * y_scales[i]
             nx     = ox + ddx
             ny     = snap_y(oy, oy + ddy, snap_radius)
         new_positions.append((nx, ny))
