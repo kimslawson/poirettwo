@@ -2,23 +2,38 @@
 """
 generate_bold_master.py
 ───────────────────────
-Adds a Bold master to Poiret One, producing a two-master .glyphs source
-ready for variable-font compilation.
+Produces Poiret Two — a monolinear variable font derived from Poiret One.
 
-Design targets
-  Regular (wght=400)  stems ≈  33 units  — Art Deco hairline
-  Bold    (wght=700)  stems ≈  73 units  — strong display weight
+Steps
+  1. Monolinear correction on the Regular master
+       Poiret One has very mild stroke contrast: vertical stems ≈ 33 units,
+       horizontal strokes ≈ 29 units.  We correct the Regular to 33/33 by
+       applying a small anisotropic expansion (delta_x=0, delta_y=2) so that
+       horizontal strokes thicken by 2 units per side without touching stems.
 
-Algorithm: per-node miter-offset expansion (DELTA = 20 units per side).
-  • CCW (outer fill) paths → nodes move outward   → shape expands
-  • CW  (inner counter) paths → nodes move inward → counter contracts
-  Both together produce visually thicker strokes.
+  2. Bold master at wght=700
+       Starting from the corrected Regular (33/33), apply a uniform miter-
+       offset expansion (DELTA = 20 per side) in all directions.  Because
+       the source is already monolinear, the Bold emerges monolinear too:
+         vertical stems  : 33 + 2×20 = 73 units
+         horizontal strokes: 33 + 2×20 = 73 units
 
-After displacement, nodes within SNAP units of a vertical alignment
-metric (y = 0, 450, 750, −208, 962) are snapped back to that metric
-so baseline and cap-height never drift.
+  3. Variable-font metadata
+       Axis: wght 400–700.  Instances: Regular/Medium/SemiBold/Bold.
+
+Geometry
+  • Anisotropic miter displacement: miter_displacement() is computed with
+    delta=1 (unit vector), then the x- and y-components are scaled
+    independently by delta_x / delta_y.
+  • CCW (outer fill) paths → nodes move outward   → shape expands.
+  • CW  (inner counter) paths → nodes move inward → counter contracts.
+  • Nodes within SNAP units of a vertical metric (y = 0, 450, 750, −208,
+    962) are snapped back so baseline/cap-height never drift.
+  • For the monolinear correction a tighter snap radius is used so that
+    interior stroke nodes (far from metrics) are corrected fully.
 """
 
+import copy
 import math
 import re
 import sys
@@ -31,14 +46,24 @@ from glyphsLib.classes import (
 )
 
 # ── Configuration ──────────────────────────────────────────────────────
-SOURCE  = "/home/user/poirettwo/sources/PoiretOne.glyphs"
-OUTPUT  = "/home/user/poirettwo/sources/PoiretOneVF.glyphs"
+SOURCE       = "/home/user/poirettwo/sources/PoiretOne.glyphs"
+OUTPUT       = "/home/user/poirettwo/sources/PoiretTwoVF.glyphs"
+FONT_FAMILY  = "Poiret Two"
 
-DELTA   = 20        # expansion per side, font units
-SNAP    = 3         # snap bold-y to metric when original is within SNAP of it
+DELTA        = 20       # Bold expansion per side, font units
+SNAP         = 3        # snap bold-y to metric when original is within SNAP
+SNAP_STRICT  = 0.5      # snap radius used during the monolinear correction
+                        # (only nodes essentially ON a metric are snapped)
+
+# Monolinear correction for Regular
+# delta_x = 0 : leave vertical stems untouched
+# delta_y = 2 : thicken horizontal strokes by 2 units per side → 29 → 33
+REG_DELTA_X  = 0
+REG_DELTA_Y  = 2
 
 # Vertical metrics to preserve across the weight axis
 METRICS = [0, 450, 750, 962, -208]
+
 
 # ── Geometry helpers ───────────────────────────────────────────────────
 
@@ -67,19 +92,20 @@ def miter_displacement(
     Both effects make strokes bolder.
 
     miter_limit caps spikes at sharp concave corners.
+
+    When delta=1.0 the return value is the unit miter-bisector vector,
+    suitable for independent x/y scaling (anisotropic expansion).
     """
     n   = len(positions)
     p   = positions[i]
     pp  = positions[(i - 1) % n]
     pn  = positions[(i + 1) % n]
 
-    # Incoming and outgoing segment vectors
     dx1, dy1 = p[0] - pp[0], p[1] - pp[1]
     dx2, dy2 = pn[0] - p[0], pn[1] - p[1]
     m1 = math.hypot(dx1, dy1)
     m2 = math.hypot(dx2, dy2)
 
-    # Handle degenerate (zero-length) segments
     if m1 < 1e-9 and m2 < 1e-9:
         return 0.0, 0.0
     if m1 < 1e-9:
@@ -92,104 +118,80 @@ def miter_displacement(
     n1x, n1y = right_normal(dx1, dy1)
     n2x, n2y = right_normal(dx2, dy2)
 
-    # Bisector of the two normals
     bx, by = n1x + n2x, n1y + n2y
     bm = math.hypot(bx, by)
     if bm < 1e-9:
-        # 180° u-turn → use n1 straight
         return delta * n1x, delta * n1y
     bx /= bm
     by /= bm
 
-    # proj = cos(half-angle between the two normals)
     proj = bx * n1x + by * n1y
     if abs(proj) < 1e-9:
         return delta * n1x, delta * n1y
 
     scale = delta / proj
-    # Apply miter limit to avoid extreme spikes at very acute corners
     if abs(scale) > miter_limit * abs(delta):
         scale = math.copysign(miter_limit * abs(delta), scale)
 
     return scale * bx, scale * by
 
 
-def snap_y_to_metric(orig_y: float, bold_y: float) -> float:
-    """If orig_y is within SNAP of an alignment metric, snap bold_y to that metric."""
+def snap_y(orig_y: float, new_y: float, radius: float) -> float:
+    """Snap new_y to the nearest alignment metric if orig_y is within radius."""
     for m in METRICS:
-        if abs(orig_y - m) <= SNAP:
+        if abs(orig_y - m) <= radius:
             return float(m)
-    return bold_y
+    return new_y
 
 
-def fix_colinear_metric_nodes(
-    positions: list[tuple[float, float]],
-    new_positions: list[tuple[float, float]],
-    delta: float,
-) -> list[tuple[float, float]]:
+# ── Path expansion ─────────────────────────────────────────────────────
+
+def expand_path(
+    orig_path: GSPath,
+    delta_x: float,
+    delta_y: float,
+    snap_radius: float = SNAP,
+) -> GSPath:
     """
-    Post-processing correction for co-linear y-metric nodes.
+    Anisotropic miter-offset expansion.
 
-    Scenario: a node sits exactly on a vertical alignment metric (y = 0,
-    450, 750 …) AND both its immediate neighbours are at the *same* y
-    (i.e. all three lie on a horizontal edge).  In that case the miter
-    algorithm produces a purely-vertical displacement which snap_y_to_metric
-    then zeros out, leaving the node unmoved.
+    delta_x  expansion applied to the x-component of each node's miter
+             displacement.  Controls horizontal movement = vertical-stem
+             thickness.
+    delta_y  expansion applied to the y-component.  Controls vertical
+             movement = horizontal-stroke thickness.
 
-    This matters at stem-to-bowl transitions: e.g., the bottom-right corner
-    of the 'B' stem at (111, 0) has leftward and rightward neighbours both at
-    y = 0, so the stem fails to widen there.
-
-    Fix: for any such "stuck" node, move it laterally (toward the path
-    centroid) by DELTA so that the stem attachment expands symmetrically.
+    For the monolinear Regular correction: delta_x=0, delta_y=2
+    For the Bold expansion: delta_x=delta_y=DELTA (isotropic)
     """
-    n = len(positions)
-    centroid_x = sum(p[0] for p in positions) / n
-    fixed = list(new_positions)
-
-    for i in range(n):
-        ox, oy = positions[i]
-        nx, ny = new_positions[i]
-
-        # Only nodes that ended up unmoved
-        if abs(nx - ox) > 0.5 or abs(ny - oy) > 0.5:
-            continue
-
-        # Only nodes originally on a vertical alignment metric
-        if not any(abs(oy - m) <= SNAP for m in METRICS):
-            continue
-
-        # Co-linearity check: both neighbours within SNAP of the same y
-        p_prev = positions[(i - 1) % n]
-        p_next = positions[(i + 1) % n]
-        if abs(p_prev[1] - oy) > SNAP or abs(p_next[1] - oy) > SNAP:
-            continue
-
-        # Apply centroid-directed lateral correction
-        if ox < centroid_x - 1:
-            fixed[i] = (ox + delta, oy)
-        elif ox > centroid_x + 1:
-            fixed[i] = (ox - delta, oy)
-
-    return fixed
-
-
-# ── Layer construction ─────────────────────────────────────────────────
-
-def make_bold_path(orig_path: GSPath) -> GSPath:
-    """Return a new GSPath with each node displaced by DELTA via miter offset."""
     positions = [(nd.position.x, nd.position.y) for nd in orig_path.nodes]
     types     = [nd.type   for nd in orig_path.nodes]
     smooths   = [nd.smooth for nd in orig_path.nodes]
 
     new_path        = GSPath()
     new_path.closed = orig_path.closed
+    new_positions   = []
     new_nodes       = []
 
     for i, (ox, oy) in enumerate(positions):
-        ddx, ddy = miter_displacement(positions, i, DELTA)
-        nx = ox + ddx
-        ny = snap_y_to_metric(oy, oy + ddy)
+        if delta_x == 0.0 and delta_y == 0.0:
+            nx, ny = ox, oy
+        else:
+            # Unit miter bisector
+            ux, uy = miter_displacement(positions, i, 1.0)
+            ddx    = ux * delta_x
+            ddy    = uy * delta_y
+            nx     = ox + ddx
+            ny     = snap_y(oy, oy + ddy, snap_radius)
+        new_positions.append((nx, ny))
+
+    # Post-process: fix co-linear nodes on metrics that got stuck during Bold
+    if abs(delta_x) > 0.5 or abs(delta_y) > 0.5:
+        new_positions = _fix_colinear_metric_nodes(
+            positions, new_positions, delta_x
+        )
+
+    for i, (nx, ny) in enumerate(new_positions):
         node = GSNode((nx, ny), type=types[i], smooth=smooths[i])
         new_nodes.append(node)
 
@@ -197,29 +199,86 @@ def make_bold_path(orig_path: GSPath) -> GSPath:
     return new_path
 
 
+def _fix_colinear_metric_nodes(
+    orig: list[tuple[float, float]],
+    new:  list[tuple[float, float]],
+    delta: float,
+) -> list[tuple[float, float]]:
+    """
+    Correct nodes that sit on a y-metric with co-linear neighbours at the
+    same y, causing the miter to produce a vertical displacement that snapping
+    then cancels — leaving the node laterally unmoved.
+
+    Example: the bottom-right inner corner of 'B' at (111, 0) has neighbours
+    both at y=0, so the stem base fails to widen.  We nudge it laterally
+    toward the path centroid by |delta|.
+    """
+    n          = len(orig)
+    centroid_x = sum(p[0] for p in orig) / n
+    fixed      = list(new)
+
+    for i in range(n):
+        ox, oy = orig[i]
+        nx, ny = new[i]
+
+        # Only truly stuck nodes
+        if abs(nx - ox) > 0.5 or abs(ny - oy) > 0.5:
+            continue
+        # Only nodes on a metric
+        if not any(abs(oy - m) <= SNAP for m in METRICS):
+            continue
+        # Both neighbours also on the same metric y
+        p_prev = orig[(i - 1) % n]
+        p_next = orig[(i + 1) % n]
+        if abs(p_prev[1] - oy) > SNAP or abs(p_next[1] - oy) > SNAP:
+            continue
+        # Nudge toward centroid
+        if ox < centroid_x - 1:
+            fixed[i] = (ox + abs(delta), oy)
+        elif ox > centroid_x + 1:
+            fixed[i] = (ox - abs(delta), oy)
+
+    return fixed
+
+
+# ── Layer helpers ──────────────────────────────────────────────────────
+
+def apply_correction_to_layer(layer: GSLayer) -> None:
+    """
+    In-place monolinear correction: expand horizontal strokes by
+    REG_DELTA_Y per side without touching vertical stems (REG_DELTA_X=0).
+    """
+    orig_paths = list(layer.paths)
+    # Remove existing paths
+    while len(layer.paths):
+        layer.paths.pop(0)
+    # Re-add corrected paths
+    for p in orig_paths:
+        layer.paths.append(
+            expand_path(p, REG_DELTA_X, REG_DELTA_Y, snap_radius=SNAP_STRICT)
+        )
+
+
 def make_bold_layer(reg_layer: GSLayer, bold_master_id: str) -> GSLayer:
     """
-    Build the Bold GSLayer for one glyph.
-    Paths are expanded; components, anchors, and advance width are copied.
+    Build the Bold GSLayer from a (monolinear-corrected) Regular layer.
+    Uniform DELTA expansion produces monolinear Bold strokes.
     """
-    bl = GSLayer()
-    bl.layerId          = bold_master_id
+    bl                    = GSLayer()
+    bl.layerId            = bold_master_id
     bl.associatedMasterId = bold_master_id
-    bl.name             = "Bold"
-    bl.width            = reg_layer.width   # keep advance width; SBs narrow naturally
+    bl.name               = "Bold"
+    bl.width              = reg_layer.width  # advance width: SBs narrow naturally
 
-    # Expand drawn outlines
     for path in reg_layer.paths:
-        bl.paths.append(make_bold_path(path))
+        bl.paths.append(expand_path(path, DELTA, DELTA, snap_radius=SNAP))
 
-    # Component references are unchanged — they'll use their own Bold layers
     for comp in reg_layer.components:
         bl.components.append(comp.clone())
 
-    # Anchors: y-coords on metrics stay on metrics; others stay put for now
     for anch in reg_layer.anchors:
-        a          = GSAnchor()
-        a.name     = anch.name
+        a            = GSAnchor()
+        a.name       = anch.name
         a.position.x = anch.position.x
         a.position.y = anch.position.y
         bl.anchors.append(a)
@@ -238,43 +297,48 @@ def main():
     print(f"Regular master: '{reg_master.name}'  id={reg_id}  wght={reg_master.weightValue}")
     print(f"Glyphs: {len(font.glyphs)}")
 
+    # ── 0. Rename font family ──────────────────────────────────────────
+    font.familyName = FONT_FAMILY
+    print(f"Font family renamed to: {FONT_FAMILY!r}")
+
+    # ── 0b. Monolinear correction on the Regular master ────────────────
+    # Equalize stroke contrast: horizontal strokes (29 units) → 33 units
+    # by expanding them by REG_DELTA_Y=2 per side.  Vertical stems are
+    # left at 33 units (REG_DELTA_X=0).
+    reg_corrected = 0
+    for glyph in font.glyphs:
+        layer = glyph.layers[reg_id]
+        if layer is None or not layer.paths:
+            continue
+        apply_correction_to_layer(layer)
+        reg_corrected += 1
+    print(f"Monolinear correction applied to {reg_corrected} Regular layers")
+
     # ── 1. Stamp explicit axis location on the Regular master ─────────
-    # glyphsLib's font_uses_axis_locations() requires ALL masters to have
-    # an "Axis Location" custom parameter; only then does it use the reliable
-    # explicit-location branch.  Without it, instance-based heuristics fire
-    # and collapse the axis to a single point.
     reg_master.customParameters.append(
         GSCustomParameter("Axis Location", [{"Axis": "Weight", "Location": 400}])
     )
 
-    # ── 1. Create Bold master ──────────────────────────────────────────
-    bold_master = GSFontMaster()
-    bold_master.name        = "Bold"
-    bold_master.weightValue = 700
-    bold_master.widthValue  = reg_master.widthValue
+    # ── 2. Create Bold master ──────────────────────────────────────────
+    bold_master              = GSFontMaster()
+    bold_master.name         = "Bold"
+    bold_master.weightValue  = 700
+    bold_master.widthValue   = reg_master.widthValue
 
-    # Copy vertical metrics
-    bold_master.ascender  = reg_master.ascender
-    bold_master.descender = reg_master.descender
-    bold_master.capHeight = reg_master.capHeight
-    bold_master.xHeight   = reg_master.xHeight
-
-    # Copy alignment zones (vertical metrics don't change)
+    bold_master.ascender     = reg_master.ascender
+    bold_master.descender    = reg_master.descender
+    bold_master.capHeight    = reg_master.capHeight
+    bold_master.xHeight      = reg_master.xHeight
     bold_master.alignmentZones = list(reg_master.alignmentZones)
 
-    # Stem values for Bold (hinting and spacing guidance)
-    # Regular h-stems: [29, 28], v-stems: [33, 29]
-    # Bold expands by 2×DELTA each = +40 units per stem
-    bold_master.horizontalStems = [s + 2 * DELTA for s in reg_master.horizontalStems]
-    bold_master.verticalStems   = [s + 2 * DELTA for s in reg_master.verticalStems]
+    # Stem values updated for monolinear Bold:
+    # Both h-stems and v-stems = REG_STEM + 2×DELTA  ≈ 33 + 40 = 73
+    bold_master.horizontalStems = [33 + 2 * DELTA]
+    bold_master.verticalStems   = [33 + 2 * DELTA]
 
-    # Copy master-level metric custom parameters verbatim
     for cp in reg_master.customParameters:
-        bold_master.customParameters.append(
-            GSCustomParameter(cp.name, cp.value)
-        )
+        bold_master.customParameters.append(GSCustomParameter(cp.name, cp.value))
 
-    # Explicit axis location for Bold master
     bold_master.customParameters.append(
         GSCustomParameter("Axis Location", [{"Axis": "Weight", "Location": 700}])
     )
@@ -283,56 +347,42 @@ def main():
     print(f"Bold master id: {bold_id}")
     font.masters.append(bold_master)
 
-    # ── 2. Add Bold kerning (copy from Regular as starting point) ──────
-    reg_kerning = font.kerning.get(reg_id, {})
-    # Deep-copy the dict structure
-    import copy
+    # ── 3. Copy kerning ────────────────────────────────────────────────
+    reg_kerning          = font.kerning.get(reg_id, {})
     font.kerning[bold_id] = copy.deepcopy(reg_kerning)
     print(f"Copied kerning: {len(reg_kerning)} first-level entries")
 
-    # ── 3. Build Bold layers for every glyph ───────────────────────────
-    no_outline = 0
-    with_paths = 0
-    composite  = 0
-    mixed      = 0
+    # ── 4. Build Bold layers for every glyph ──────────────────────────
+    no_outline = with_paths = composite = mixed = 0
 
     for glyph in font.glyphs:
         reg_layer = glyph.layers[reg_id]
         if reg_layer is None:
             continue
 
-        has_paths  = len(reg_layer.paths)      > 0
-        has_comps  = len(reg_layer.components) > 0
+        has_paths = len(reg_layer.paths)      > 0
+        has_comps = len(reg_layer.components) > 0
 
         bl = make_bold_layer(reg_layer, bold_id)
         glyph.layers.append(bl)
-        # Copy smart-component pole mapping (needs parent to be set first)
+
         if reg_layer.smartComponentPoleMapping:
             bl.smartComponentPoleMapping = dict(reg_layer.smartComponentPoleMapping)
 
-        if has_paths and has_comps:
-            mixed += 1
-        elif has_paths:
-            with_paths += 1
-        elif has_comps:
-            composite += 1
-        else:
-            no_outline += 1
+        if   has_paths and has_comps: mixed      += 1
+        elif has_paths:               with_paths += 1
+        elif has_comps:               composite  += 1
+        else:                         no_outline += 1
 
     print(f"Processed glyphs: {with_paths} paths-only  "
           f"{composite} composite  {mixed} mixed  {no_outline} empty")
 
-    # ── 3b. Add Bold alternate layers for smart-component part glyphs ──
-    # Each _part.* glyph has a "Short"/"short" alternate layer (a
-    # Glyphs smart-component master).  glyphsLib requires a matching Bold
-    # alternate layer when building a variable font.
-    # We skip date-stamped backup layers ("Regular Jul …").
-    _date_re = re.compile(r'^Regular [A-Z][a-z]{2} ')
+    # ── 4b. Bold alternate layers for smart-component glyphs ──────────
+    _date_re      = re.compile(r'^Regular [A-Z][a-z]{2} ')
     smart_alt_added = 0
 
     for glyph in font.glyphs:
-        for alt_layer in list(glyph.layers):   # snapshot to avoid mutation issues
-            # Only handle Regular-master alternate layers that look like design variants
+        for alt_layer in list(glyph.layers):
             if alt_layer.associatedMasterId != reg_id:
                 continue
             if alt_layer.layerId == reg_id:
@@ -340,32 +390,26 @@ def main():
             if _date_re.match(alt_layer.name or ''):
                 continue
 
-            # Check whether a matching Bold alternate already exists
             bold_alt_exists = any(
-                la.associatedMasterId == bold_id
-                and la.name == alt_layer.name
+                la.associatedMasterId == bold_id and la.name == alt_layer.name
                 for la in glyph.layers
             )
             if bold_alt_exists:
                 continue
 
-            # Create Bold alternate layer
-            new_id = str(uuid.uuid4()).upper()
-            bl = make_bold_layer(alt_layer, new_id)   # reuse our helper
-            # Override the IDs: alternates share associatedMasterId with Bold
+            new_id                = str(uuid.uuid4()).upper()
+            bl                    = make_bold_layer(alt_layer, new_id)
             bl.layerId            = new_id
             bl.associatedMasterId = bold_id
-            bl.name               = alt_layer.name    # keep "Short" / "short"
-            # Copy smart-component pole mapping from the Regular alternate
+            bl.name               = alt_layer.name
             glyph.layers.append(bl)
-            # Set pole mapping after appending (needs parent to be set first)
             if alt_layer.smartComponentPoleMapping:
                 bl.smartComponentPoleMapping = dict(alt_layer.smartComponentPoleMapping)
             smart_alt_added += 1
 
     print(f"Added Bold alternates for smart-component layers: {smart_alt_added}")
 
-    # ── 4. Add variable-font axis metadata ────────────────────────────
+    # ── 5. Variable-font axis metadata ────────────────────────────────
     font.customParameters.append(
         GSCustomParameter("Axes", [{"Name": "Weight", "Tag": "wght"}])
     )
@@ -373,23 +417,18 @@ def main():
         GSCustomParameter("Variable Font Origin", "Regular")
     )
 
-    # ── 5. Update instances for named styles ──────────────────────────
-    # Use pure weightValue-based locations — no instanceInterpolations,
-    # which would engage manual-interpolation mode and confuse glyphsLib's
-    # axis-range detection.
+    # ── 6. Named instances ────────────────────────────────────────────
     font.instances.clear()
-
     for name, wv in [("Regular", 400), ("Medium", 500), ("SemiBold", 600), ("Bold", 700)]:
         inst             = GSInstance()
         inst.name        = name
         inst.weightValue = wv
-        # Explicit axis location so glyphsLib can read user-space positions
         inst.customParameters.append(
             GSCustomParameter("Axis Location", [{"Axis": "Weight", "Location": wv}])
         )
         font.instances.append(inst)
 
-    # ── 6. Save ────────────────────────────────────────────────────────
+    # ── 7. Save ────────────────────────────────────────────────────────
     print(f"Saving  {OUTPUT}")
     font.save(OUTPUT)
     print("Done.")
